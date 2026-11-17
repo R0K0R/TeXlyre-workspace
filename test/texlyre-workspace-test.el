@@ -39,7 +39,9 @@
 (ert-deftest tlw-test-mirror-dir ()
   (let ((texlyre-workspace-mirror-directory "/m/"))
     (should (equal (texlyre-workspace--mirror-dir '(:name "My relay (x)") "abc")
-                   "/m/My-relay-x/abc/"))))
+                   "/m/My-relay-x/abc/")))
+  (let ((texlyre-workspace-mirror-directory nil))
+    (should-not (texlyre-workspace--mirror-dir '(:name "T") "abc"))))
 
 (ert-deftest tlw-test-relay-lookup ()
   (let ((texlyre-workspace-relays '((:name "A" :url "ws://a/yws") (:name "B" :url "ws://b/yws"))))
@@ -99,6 +101,11 @@
 
 ;;; With the bridge (TeXlyre_bridge --test behind test/shim.py)
 
+(defvar tlw-test--answer nil
+  "What the stubbed `read-directory-name' returns; nil: the prompt's initial directory.
+`none' makes any prompt an error.")
+(defvar tlw-test--prompts nil "The initial directory of every prompt, newest first.")
+
 (defmacro tlw-test--with-open (log &rest body)
   "Run BODY with LOG bound to the shim's log file and everything sandboxed."
   (declare (indent 1))
@@ -107,6 +114,9 @@
           (texlyre-workspace--sessions nil)
           (emacs-collab--connections nil)
           (emacs-collab-layout-state-file (expand-file-name "layout.eld" base))
+          (emacs-collab-mirror-state-file (expand-file-name "mirrors.eld" base))
+          (emacs-collab-mirror--table 'unloaded)
+          (tlw-test--answer nil) (tlw-test--prompts nil)
           (emacs-collab-layout--sizes nil) (emacs-collab-layout--sizes-loaded nil)
           (emacs-collab-layout--projects nil) (emacs-collab-layout-register-lsp nil)
           (texlyre-workspace-project-history nil)
@@ -120,7 +130,12 @@
           (texlyre-workspace-relays '((:name "T" :url "ws://t.example:1/yws")))
           (unrelated (generate-new-buffer "*unrelated*")))
      (unwind-protect
-         (save-window-excursion ,@body)
+         (cl-letf (((symbol-function 'read-directory-name)
+                    (lambda (_prompt &optional dir &rest _)
+                      (push dir tlw-test--prompts)
+                      (when (eq tlw-test--answer 'none) (error "unexpected prompt"))
+                      (or tlw-test--answer dir))))
+           (save-window-excursion ,@body))
        (ignore-errors (when texlyre-workspace--sessions (texlyre-quit)))
        (dolist (b (buffer-list))
          (when-let* ((f (buffer-file-name b)))
@@ -183,6 +198,45 @@
       (should-not emacs-collab-attach-predicate)
       (should (buffer-live-p unrelated))
       (should (= 1 (length (window-list nil 'no-minibuf)))))))
+
+(ert-deftest tlw-test-mirror-selected-remembered-forced ()
+  (skip-unless (file-executable-p tlw-test--bridge))
+  (tlw-test--with-open log
+    (let* ((texlyre-workspace-mirror-directory nil)
+           (id tlw-test--uuid)
+           (chosen (file-name-as-directory (expand-file-name "picked/here" base)))
+           (other (file-name-as-directory (expand-file-name "second" base))))
+      (dolist (d (list chosen other))
+        (make-directory d t)
+        (with-temp-file (expand-file-name "main.tex" d)
+          (insert "\\documentclass{article}\n\\begin{document}\nx\n\\end{document}\n")))
+      (setq tlw-test--answer chosen)
+      (texlyre-open-project "T" id)
+      (tlw-test--wait (lambda () (emacs-collab-layout-project chosen)))
+      (should (= 1 (length tlw-test--prompts)))
+      (let ((p (alist-get 'params
+                          (json-parse-string (car (split-string (with-temp-buffer
+                                                                  (insert-file-contents log)
+                                                                  (buffer-string))
+                                                                "\n" t))
+                                             :object-type 'alist))))
+        (should (equal (alist-get 'mirror_dir p) (directory-file-name chosen))))
+      (texlyre-quit)
+      ;; remembered: no prompt
+      (setq tlw-test--answer 'none)
+      (texlyre-open-project "T" id)
+      (tlw-test--wait (lambda () (emacs-collab-layout-project chosen)))
+      (should (= 1 (length tlw-test--prompts)))
+      (texlyre-quit)
+      ;; forced: prompts again, starting from the remembered directory
+      (setq tlw-test--answer other)
+      (texlyre-open-project "T" id t)
+      (tlw-test--wait (lambda () (emacs-collab-layout-project other)))
+      (should (= 2 (length tlw-test--prompts)))
+      (should (equal (car tlw-test--prompts) chosen))
+      (should (equal (emacs-collab-mirror-remembered "texlyre" (format "ws://t.example:1/yws %s" id))
+                     other))
+      (texlyre-quit))))
 
 (ert-deftest tlw-test-already-open ()
   (skip-unless (file-executable-p tlw-test--bridge))

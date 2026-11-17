@@ -33,6 +33,7 @@
 (require 'subr-x)
 (require 'emacs-collab)
 (require 'emacs-collab-layout)
+(require 'emacs-collab-mirror)
 
 (defgroup texlyre-workspace nil
   "TeXlyre workspace on emacs-collab."
@@ -50,8 +51,11 @@ usually wss://<host of your TeXlyre>/yws (ws:// without TLS)."
   "The bridge: an argv list, or a string naming the executable."
   :type '(choice (repeat string) string))
 
-(defcustom texlyre-workspace-mirror-directory "~/collab/texlyre/"
-  "Where projects are mirrored, as RELAY/UUID below this directory."
+(defcustom texlyre-workspace-mirror-directory nil
+  "Suggested location of mirrors, as RELAY/UUID below this directory.
+Only the suggestion shown when asking where to keep a project's local
+copy (see `emacs-collab-read-mirror-dir'); nil suggests nothing, and
+`emacs-collab-mirror-root' applies."
   :type 'directory)
 
 (defcustom texlyre-workspace-layout-args '(:tree t :terminal t)
@@ -141,9 +145,17 @@ into the mirror must not be sent to the bridge as a document."
     (string-trim r "-+" "-+")))
 
 (defun texlyre-workspace--mirror-dir (relay id)
-  (file-name-as-directory
-   (expand-file-name (concat (texlyre-workspace--slug (plist-get relay :name)) "/" id)
-                     texlyre-workspace-mirror-directory)))
+  "Suggested mirror of project ID on RELAY from the defcustom, or nil."
+  (when texlyre-workspace-mirror-directory
+    (file-name-as-directory
+     (expand-file-name (concat (texlyre-workspace--slug (plist-get relay :name)) "/" id)
+                       texlyre-workspace-mirror-directory))))
+
+(defun texlyre-workspace--select-mirror (relay id force)
+  "Ask where project ID on RELAY is mirrored (remembered unless FORCE)."
+  (emacs-collab-read-mirror-dir
+   "texlyre" (format "%s %s" (plist-get relay :url) id)
+   (texlyre-workspace--mirror-dir relay id) force))
 
 (defun texlyre-workspace--bridge-argv ()
   (let* ((c texlyre-workspace-bridge-command)
@@ -194,17 +206,19 @@ that has one, else the bridge's `main', else the first .tex file."
 ;;; Opening
 
 ;;;###autoload
-(defun texlyre-open-project (&optional relay project)
+(defun texlyre-open-project (&optional relay project force-select)
   "Open a TeXlyre PROJECT through RELAY and build the workspace.
 Interactively, pick a relay, then paste a share link or UUID.  The layout
-is built once the bridge reports `ready'.  Return the emacs-collab
-connection."
-  (interactive)
+is built once the bridge reports `ready'.  The local copy goes where
+`emacs-collab-read-mirror-dir' says: the directory chosen the first time,
+remembered per project; with a prefix argument (FORCE-SELECT) choose
+again.  Return the emacs-collab connection."
+  (interactive (list nil nil current-prefix-arg))
   (let* ((relay (if relay (texlyre-workspace--relay relay) (texlyre-workspace--read-relay)))
          (id (texlyre-workspace-parse-project
               (or project (read-string "TeXlyre share link or project UUID: " nil
                                        'texlyre-workspace-project-history))))
-         (mirror (texlyre-workspace--mirror-dir relay id))
+         (mirror (texlyre-workspace--select-mirror relay id force-select))
          (argv (texlyre-workspace--bridge-argv))
          (params `((relay . ,(plist-get relay :url))
                    (project . ,id)
@@ -212,7 +226,6 @@ connection."
     (when (cl-find (file-truename mirror) texlyre-workspace--sessions
                    :key #'texlyre-workspace-session-mirror :test #'equal)
       (user-error "Already open: %s" mirror))
-    (make-directory mirror t)
     (texlyre-workspace--install)
     (let* ((s (texlyre-workspace--make-session :relay relay :project id
                                                :mirror (file-truename mirror)))
